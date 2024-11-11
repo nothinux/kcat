@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/mman.h>
 #else
 #pragma comment(lib, "ws2_32.lib")
@@ -1818,8 +1819,11 @@ static int try_conf_set (const char *name, char *val,
                                                    NULL, 1/*fatal*/);
                 return 0;
         } else if (!strcmp(name, "oauthbearer.token.lifetime")) {
-                conf.oauthbearer_token_lifetime =
-                        (time(NULL) * 1000) + atoi(val);
+                if (val == NULL || *val == '\0') {
+                        conf.oauthbearer_token_lifetime = (time(NULL) * 1000) + 3600000; // Default to 1 hour if value is nil
+                } else {
+                        conf.oauthbearer_token_lifetime = (time(NULL) * 1000) + atoi(val);
+                }
                 return 0;
         } else if (!strcmp(name, "oauthbearer.token.principal")) {
                 conf.oauthbearer_token_principal = val;
@@ -2516,12 +2520,11 @@ static void argparse (int argc, char **argv,
                       0);
 
 #ifdef RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH
-        i = !conf.oauthbearer_token + !conf.oauthbearer_token_lifetime +
-                !conf.oauthbearer_token_principal;
-        if (i != 0 && i != 3) {
+        i = !conf.oauthbearer_token + !conf.oauthbearer_token_principal;
+        if (i != 0 && i != 2) {
                 usage(argv[0], 1,
-                      "all three "
-                      "-X oauthbearer.token.{file,lifetime,principal} "
+                      "both "
+                      "-X oauthbearer.token.{file,principal} "
                       "properties must be set", 0);
         } else if (i == 0) {
                 if (try_conf_set("sasl.mechanisms", "OAUTHBEARER",
