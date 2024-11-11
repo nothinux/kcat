@@ -1,5 +1,5 @@
 /*
- * kafkacat - Apache Kafka consumer and producer
+ * kcat - Apache Kafka consumer and producer
  *
  * Copyright (c) 2015-2019, Magnus Edenhill
  * All rights reserved.
@@ -59,6 +59,10 @@
 #define HAVE_CONTROLLERID 0
 #endif
 
+#if RD_KAFKA_VERSION >= 0x01030000
+#define ENABLE_MOCK 1
+#endif
+
 
 typedef enum {
         KC_FMT_STR,
@@ -101,8 +105,11 @@ struct conf {
 #define CONF_F_BROKERS_SEEN   0x200 /* Brokers have been configured */
 #define CONF_F_FMT_AVRO_KEY   0x400 /* Convert key from Avro to JSON */
 #define CONF_F_FMT_AVRO_VALUE 0x800 /* Convert value from Avro to JSON  */
-        int     delim;
-        int     key_delim;
+#define CONF_F_SR_URL_SEEN    0x1000 /* schema.registry.url/-r seen */
+        char   *delim;
+        size_t  delim_size;
+        char   *key_delim;
+        size_t  key_delim_size;
 
         struct {
                 fmt_type_t type;
@@ -128,10 +135,15 @@ struct conf {
         int64_t startts;
         int64_t stopts;
 #endif
-        int     exit_eof;
         int64_t msg_cnt;
+        int     exit_eof;
+        int     eof_cnt;  /**< Current number of partitions reached EOF */
+        rd_kafka_topic_partition_list_t *assignment; /**< Current -G consumer
+                                                      *   assignment */
+        int     metadata_timeout;
         char   *null_str;
         int     null_str_len;
+        int     txn;
 
         rd_kafka_conf_t       *rk_conf;
         rd_kafka_topic_conf_t *rkt_conf;
@@ -144,10 +156,18 @@ struct conf {
         char   *oauthbearer_token;
         int64_t oauthbearer_token_lifetime;
         const char *oauthbearer_token_principal;
+        
+        int term_sig;  /**< Termination signal */
 
 #if ENABLE_AVRO
         serdes_conf_t *srconf;
         char   *schema_registry_url;
+#endif
+
+#if ENABLE_MOCK
+        struct {
+                int broker_cnt;
+        } mock;
 #endif
 };
 
@@ -206,7 +226,7 @@ int  json_can_emit_verbatim (void);
 /*
  * avro.c
  */
-char *kc_avro_to_json (const void *data, size_t data_len,
+char *kc_avro_to_json (const void *data, size_t data_len, int *schema_idp,
                        char *errstr, size_t errstr_size);
 
 void kc_avro_init (const char *key_schema_name,

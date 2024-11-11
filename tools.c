@@ -1,5 +1,5 @@
 /*
- * kafkacat - Apache Kafka consumer and producer
+ * kcat - Apache Kafka consumer and producer
  *
  * Copyright (c) 2016, Magnus Edenhill
  * All rights reserved.
@@ -26,7 +26,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "kafkacat.h"
+#include "kcat.h"
 
 void partition_list_print (rd_kafka_topic_partition_list_t *parts,
                            void *json_gen) {
@@ -63,7 +63,8 @@ int query_offsets_by_time (rd_kafka_topic_partition_list_t *offsets) {
 
         set_oauthbearer_token(conf.rk);
 
-        err = rd_kafka_offsets_for_times(conf.rk, offsets, 10*1000);
+        err = rd_kafka_offsets_for_times(conf.rk, offsets,
+                                         conf.metadata_timeout * 1000);
 #else
         err = RD_KAFKA_RESP_ERR__NOT_IMPLEMENTED;
 #endif

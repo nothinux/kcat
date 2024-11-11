@@ -1,7 +1,7 @@
 /*
- * kafkacat - Apache Kafka consumer and producer
+ * kcat - Apache Kafka consumer and producer
  *
- * Copyright (c) 2014-2019, Magnus Edenhill
+ * Copyright (c) 2014-2021, Magnus Edenhill
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -48,7 +48,20 @@
 
 
 
-#include "kafkacat.h"
+#include "kcat.h"
+#include "input.h"
+
+#if ENABLE_MOCK
+#include <librdkafka/rdkafka_mock.h>
+#endif
+
+#if RD_KAFKA_VERSION >= 0x01040000
+#define ENABLE_TXNS 1
+#endif
+
+#if RD_KAFKA_VERSION >= 0x01060000
+#define ENABLE_INCREMENTAL_ASSIGN 1
+#endif
 
 
 struct conf conf = {
@@ -59,6 +72,8 @@ struct conf conf = {
         .msg_size = 1024*1024,
         .null_str = "NULL",
         .fixed_key = NULL,
+        .metadata_timeout = 5,
+        .offset = RD_KAFKA_OFFSET_INVALID,
 };
 
 static struct stats {
@@ -102,7 +117,8 @@ void RD_NORETURN fatal0 (const char *func, int line,
 /**
  * Print error and exit if needed
  */
-void error0 (int exitonerror, const char *func, int line, const char *fmt, ...) {
+void error0 (int exitonerror, const char *func, int line,
+             const char *fmt, ...) {
         va_list ap;
         char buf[1024];
 
@@ -114,7 +130,7 @@ void error0 (int exitonerror, const char *func, int line, const char *fmt, ...) 
                 KC_INFO(2, "Error at %s:%i:\n", func, line);
 
         fprintf(stderr, "%% ERROR: %s%s\n",
-                buf, exitonerror ? " : terminating":"");
+                buf, exitonerror ? ": terminating":"");
 
         if (exitonerror)
                 exit(1);
@@ -152,7 +168,14 @@ void set_oauthbearer_token (rd_kafka_t *rk) {
  */
 static void dr_msg_cb (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
                        void *opaque) {
+        int32_t broker_id = -1;
+        struct buf *b = rkmessage->_private;
+#if RD_KAFKA_VERSION < 0x01000000
         static int say_once = 1;
+#endif
+
+        if (b)
+                buf_destroy(b);
 
         if (rkmessage->err) {
                 KC_INFO(1, "Delivery failed for message: %s\n",
@@ -161,14 +184,23 @@ static void dr_msg_cb (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
                 return;
         }
 
-        KC_INFO(3, "Message delivered to partition %"PRId32" (offset %"PRId64")\n",
-                rkmessage->partition, rkmessage->offset);
+#if RD_KAFKA_VERSION >= 0x010500ff
+        broker_id = rd_kafka_message_broker_id(rkmessage);
+#endif
 
+        KC_INFO(3,
+                "Message delivered to partition %"PRId32" (offset %"PRId64") "
+                "on broker %"PRId32"\n",
+                rkmessage->partition, rkmessage->offset, broker_id);
+
+#if RD_KAFKA_VERSION < 0x01000000
         if (rkmessage->offset == 0 && say_once) {
                 KC_INFO(3, "Enable message offset reporting "
                         "with '-X topic.produce.offset.report=true'\n");
                 say_once = 0;
         }
+#endif
+
         stats.tx_delivered++;
 }
 
@@ -178,7 +210,8 @@ static void dr_msg_cb (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
  * exits hard on error.
  */
 static void produce (void *buf, size_t len,
-                     const void *key, size_t key_len, int msgflags) {
+                     const void *key, size_t key_len, int msgflags,
+                     void *msg_opaque) {
         rd_kafka_headers_t *hdrs = NULL;
 
         /* Headers are freed on successful producev(), pass a copy. */
@@ -201,6 +234,7 @@ static void produce (void *buf, size_t len,
                         RD_KAFKA_V_VALUE(buf, len),
                         RD_KAFKA_V_KEY(key, key_len),
                         RD_KAFKA_V_HEADERS(hdrs),
+                        RD_KAFKA_V_OPAQUE(msg_opaque),
                         RD_KAFKA_V_END);
 
                 if (!err) {
@@ -285,7 +319,7 @@ static ssize_t produce_file (const char *path) {
 
         KC_INFO(4, "Producing file %s (%"PRIdMAX" bytes)\n",
                 path, (intmax_t)st.st_size);
-        produce(ptr, sz, conf.fixed_key, conf.fixed_key_len, msgflags);
+        produce(ptr, sz, conf.fixed_key, conf.fixed_key_len, msgflags, NULL);
 
         _COMPAT(close)(fd);
 
@@ -300,15 +334,57 @@ static ssize_t produce_file (const char *path) {
 }
 
 
+static char *rd_strnstr (const char *haystack, size_t size,
+                         const char *needle, size_t needle_len) {
+        const char *nend = needle + needle_len - 1;
+        const char *t;
+        size_t of = needle_len - 1;
+
+        while (of < size &&
+               (t = (const char *)memchr((void *)(haystack + of),
+                                         (int)*nend,
+                                         size - of))) {
+                const char *n = nend;
+                const char *p = t;
+
+                do {
+                        n--;
+                        p--;
+                } while (n >= needle && *n == *p);
+
+                if (n < needle)
+                        return (char *)p+1;
+
+                of = (size_t)(t - haystack) + 1;
+        }
+
+        return NULL;
+}
+
+
 /**
  * Run producer, reading messages from 'fp' and producing to kafka.
  * Or if 'pathcnt' is > 0, read messages from files in 'paths' instead.
  */
 static void producer_run (FILE *fp, char **paths, int pathcnt) {
-        char   *sbuf  = NULL;
-        size_t  size = 0;
-        ssize_t len;
         char    errstr[512];
+        char    tmp[16];
+        size_t  tsize = sizeof(tmp);
+
+        if (rd_kafka_conf_get(conf.rk_conf, "transactional.id",
+                              tmp, &tsize) == RD_KAFKA_CONF_OK && tsize > 1) {
+                KC_INFO(1, "Using transactional producer\n");
+                conf.txn = 1;
+        }
+
+        tsize = sizeof(tmp);
+        if (rd_kafka_conf_get(conf.rk_conf, "message.max.bytes",
+                              tmp, &tsize) == RD_KAFKA_CONF_OK && tsize > 1) {
+                int msg_max_bytes = atoi(tmp);
+                KC_INFO(3, "Setting producer input buffer max size to "
+                        "message.max.bytes value %d\n", msg_max_bytes);
+                conf.msg_size = msg_max_bytes;
+        }
 
         /* Assign per-message delivery report callback. */
         rd_kafka_conf_set_dr_msg_cb(conf.rk_conf, dr_msg_cb);
@@ -322,6 +398,23 @@ static void producer_run (FILE *fp, char **paths, int pathcnt) {
 
         if (!conf.debug && conf.verbosity == 0)
                 rd_kafka_set_log_level(conf.rk, 0);
+
+#if ENABLE_TXNS
+        if (conf.txn) {
+                rd_kafka_error_t *error;
+
+                error = rd_kafka_init_transactions(conf.rk,
+                                                   conf.metadata_timeout*1000);
+                if (error)
+                        KC_FATAL("init_transactions(): %s",
+                                 rd_kafka_error_string(error));
+
+                error = rd_kafka_begin_transaction(conf.rk);
+                if (error)
+                        KC_FATAL("begin_transaction(): %s",
+                                 rd_kafka_error_string(error));
+        }
+#endif
 
         /* Create topic */
         if (!(conf.rkt = rd_kafka_topic_new(conf.rk, conf.topic,
@@ -349,40 +442,36 @@ static void producer_run (FILE *fp, char **paths, int pathcnt) {
                                 pathcnt - good, pathcnt);
 
         } else {
+                struct inbuf inbuf;
+                struct buf *b;
+                int at_eof = 0;
+
+                inbuf_init(&inbuf, conf.msg_size, conf.delim, conf.delim_size);
+
                 /* Read messages from input, delimited by conf.delim */
                 while (conf.run &&
-                       (len = getdelim(&sbuf, &size, conf.delim, fp)) != -1) {
+                       !(at_eof = !inbuf_read_to_delimeter(&inbuf, fp, &b))) {
                         int msgflags = 0;
-                        char *buf = sbuf;
+                        char *buf = b->buf;
                         char *key = NULL;
                         size_t key_len = 0;
-                        size_t orig_len = len;
+                        size_t len = b->size;
 
-                        if (len == 0)
+                        if (len == 0) {
+                                buf_destroy(b);
                                 continue;
-
-                        /* Shave off delimiter */
-                        if ((int)buf[len-1] == conf.delim)
-                                len--;
-
-                        if (len == 0)
-                                continue;
+                        }
 
                         /* Extract key, if desired and found. */
                         if (conf.flags & CONF_F_KEY_DELIM) {
                                 char *t;
-                                if ((t = memchr(buf, conf.key_delim, len))) {
-                                        key_len = (size_t)(t-sbuf);
+                                if ((t = rd_strnstr(buf, len,
+                                                    conf.key_delim,
+                                                    conf.key_delim_size))) {
+                                        key_len = (size_t)(t-buf);
                                         key     = buf;
-                                        buf    += key_len+1;
-                                        len    -= key_len+1;
-
-                                        /* Since buf has been forwarded
-                                         * from its initial allocation point
-                                         * we must make sure we dont tell
-                                         * librdkafka to free it (since the
-                                         * address would be wrong). */
-                                        msgflags |= RD_KAFKA_MSG_F_COPY;
+                                        buf     = t + conf.key_delim_size;
+                                        len    -= key_len + conf.key_delim_size;
 
                                         if (conf.flags & CONF_F_NULL) {
                                                 if (len == 0)
@@ -398,36 +487,27 @@ static void producer_run (FILE *fp, char **paths, int pathcnt) {
                                 key_len = conf.fixed_key_len;
                         }
 
-                        if (!(msgflags & RD_KAFKA_MSG_F_COPY) &&
-                            len > 1024 && !(conf.flags & CONF_F_TEE)) {
-                                /* If message is larger than this arbitrary
+                        if (len < 1024) {
+                                /* If message is smaller than this arbitrary
                                  * threshold it will be more effective to
-                                 * not copy the data but let rdkafka own it
-                                 * instead.
-                                 *
-                                 * Note that CONF_T_TEE must be checked,
-                                 * otherwise a possible race might occur.
-                                 * */
-                                msgflags |= RD_KAFKA_MSG_F_FREE;
-                        } else {
-                                /* For smaller messages a copy is
-                                 * more efficient. */
+                                 * copy the data in librdkafka. */
                                 msgflags |= RD_KAFKA_MSG_F_COPY;
                         }
 
                         /* Produce message */
-                        produce(buf, len, key, key_len, msgflags);
+                        produce(buf, len, key, key_len, msgflags,
+                                (msgflags & RD_KAFKA_MSG_F_COPY) ?
+                                NULL : b);
 
                         if (conf.flags & CONF_F_TEE &&
-                            fwrite(sbuf, orig_len, 1, stdout) != 1)
-                                KC_FATAL("Tee write error for message of %zd bytes: %s",
-                                         orig_len, strerror(errno));
+                            fwrite(b->buf, b->size, 1, stdout) != 1)
+                                KC_FATAL("Tee write error for message "
+                                         "of %zd bytes: %s",
+                                         b->size, strerror(errno));
 
-                        if (msgflags & RD_KAFKA_MSG_F_FREE) {
-                                /* rdkafka owns the allocated buffer
-                                 * memory now. */
-                                sbuf  = NULL;
-                                size = 0;
+                        if (msgflags & RD_KAFKA_MSG_F_COPY) {
+                                /* librdkafka made a copy of the input. */
+                                buf_destroy(b);
                         }
 
                         /* Enforce -c <cnt> */
@@ -435,12 +515,38 @@ static void producer_run (FILE *fp, char **paths, int pathcnt) {
                                 conf.run = 0;
                 }
 
-                if (conf.run) {
-                        if (!feof(fp))
-                                KC_FATAL("Unable to read message: %s",
-                                         strerror(errno));
-                }
+                if (conf.run && !at_eof)
+                        KC_FATAL("Unable to read message: %s",
+                                 strerror(errno));
         }
+
+#if ENABLE_TXNS
+        if (conf.txn) {
+                rd_kafka_error_t *error;
+                const char *what;
+
+                if (conf.term_sig) {
+                        KC_INFO(0,
+                                "Aborting transaction due to "
+                                "termination signal\n");
+                        what = "abort_transaction()";
+                        error = rd_kafka_abort_transaction(
+                                conf.rk, conf.metadata_timeout * 1000);
+                } else {
+                        KC_INFO(1, "Committing transaction\n");
+                        what = "commit_transaction()";
+                        error = rd_kafka_commit_transaction(
+                                conf.rk, conf.metadata_timeout * 1000);
+                        if (!error)
+                                KC_INFO(1,
+                                        "Transaction successfully committed\n");
+                }
+
+                if (error)
+                        KC_FATAL("%s: %s", what, rd_kafka_error_string(error));
+        }
+#endif
+
 
         /* Wait for all messages to be transmitted */
         conf.run = 1;
@@ -449,9 +555,6 @@ static void producer_run (FILE *fp, char **paths, int pathcnt) {
 
         rd_kafka_topic_destroy(conf.rkt);
         rd_kafka_destroy(conf.rk);
-
-        if (sbuf)
-                free(sbuf);
 
         if (stats.tx_err_dr)
                 conf.exitcode = 1;
@@ -469,7 +572,35 @@ static void stop_partition (rd_kafka_message_t *rkmessage) {
         }
 }
 
-static void handle_partition_eof (rd_kafka_message_t *rkmessage) {
+
+/**
+ * @brief Mark partition as not at EOF
+ */
+static void partition_not_eof (const rd_kafka_message_t *rkmessage) {
+        rd_kafka_topic_partition_t *rktpar;
+
+        if (conf.mode != 'G' || !conf.exit_eof ||
+            !conf.assignment || conf.eof_cnt == 0)
+                return;
+
+        /* Find partition in assignment */
+        rktpar = rd_kafka_topic_partition_list_find(
+                conf.assignment,
+                rd_kafka_topic_name(rkmessage->rkt),
+                rkmessage->partition);
+
+        if (!rktpar || rktpar->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
+                return;
+
+        rktpar->err = RD_KAFKA_RESP_ERR_NO_ERROR;
+        conf.eof_cnt--;
+}
+
+
+/**
+ * @brief Mark partition as at EOF
+ */
+static void partition_at_eof (rd_kafka_message_t *rkmessage) {
 
         if (conf.mode == 'C') {
                 /* Store EOF offset.
@@ -483,9 +614,22 @@ static void handle_partition_eof (rd_kafka_message_t *rkmessage) {
                         stop_partition(rkmessage);
                 }
 
-        } else if (conf.mode == 'G') {
-                /* FIXME: Not currently handled */
+        } else if (conf.mode == 'G' && conf.exit_eof && conf.assignment) {
+                /* Find partition in assignment */
+                rd_kafka_topic_partition_t *rktpar;
 
+                rktpar = rd_kafka_topic_partition_list_find(
+                        conf.assignment,
+                        rd_kafka_topic_name(rkmessage->rkt),
+                        rkmessage->partition);
+
+                if (rktpar && rktpar->err != RD_KAFKA_RESP_ERR__PARTITION_EOF) {
+                        rktpar->err = RD_KAFKA_RESP_ERR__PARTITION_EOF;
+                        conf.eof_cnt++;
+
+                        if (conf.eof_cnt == conf.assignment->cnt)
+                                conf.run = 0;
+                }
         }
 
         KC_INFO(1, "Reached end of topic %s [%"PRId32"] "
@@ -508,7 +652,7 @@ static void consume_cb (rd_kafka_message_t *rkmessage, void *opaque) {
 
         if (rkmessage->err) {
                 if (rkmessage->err == RD_KAFKA_RESP_ERR__PARTITION_EOF) {
-                        handle_partition_eof(rkmessage);
+                        partition_at_eof(rkmessage);
                         return;
                 }
 
@@ -521,19 +665,22 @@ static void consume_cb (rd_kafka_message_t *rkmessage, void *opaque) {
                         KC_FATAL("Consumer error: %s",
                                  rd_kafka_message_errstr(rkmessage));
 
+        } else {
+                partition_not_eof(rkmessage);
         }
 
         if (conf.stopts) {
                 int64_t ts = rd_kafka_message_timestamp(rkmessage, NULL);
                 if (ts >= conf.stopts) {
                         stop_partition(rkmessage);
-                        KC_INFO(1, "Reached stop timestamp for topic %s [%"PRId32"] "
+                        KC_INFO(1, "Reached stop timestamp for topic "
+                                "%s [%"PRId32"] "
                                 "at offset %"PRId64"%s\n",
                                 rd_kafka_topic_name(rkmessage->rkt),
                                 rkmessage->partition,
                                 rkmessage->offset,
                                 !conf.run ? ": exiting" : "");
-                        return;                       
+                        return;
                 }
         }
 
@@ -575,9 +722,100 @@ static void print_partition_list (int is_assigned,
         fprintf(stderr, "\n");
 }
 
+
+#if ENABLE_INCREMENTAL_ASSIGN
+static void
+incremental_rebalance_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
+                          rd_kafka_topic_partition_list_t *partitions,
+                          void *opaque) {
+        rd_kafka_error_t *error = NULL;
+        int i;
+
+        KC_INFO(1, "Group %s rebalanced: incremental %s of %d partition(s) "
+                "(memberid %s%s, %s rebalance protocol): ",
+                conf.group,
+                err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS ?
+                "assignment" : "revoke",
+                partitions->cnt,
+                rd_kafka_memberid(rk),
+                rd_kafka_assignment_lost(rk) ? ", assignment lost" : "",
+                rd_kafka_rebalance_protocol(rk));
+
+        switch (err)
+        {
+        case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
+                if (conf.verbosity >= 1)
+                        print_partition_list(1, partitions);
+
+                if (!conf.assignment)
+                        conf.assignment =
+                                rd_kafka_topic_partition_list_new(
+                                        partitions->cnt);
+
+                for (i = 0 ; i < partitions->cnt ; i++) {
+                        rd_kafka_topic_partition_t *rktpar =
+                                &partitions->elems[i];
+
+                        /* Set start offset from -o .. */
+                        if (conf.offset != RD_KAFKA_OFFSET_INVALID)
+                                rktpar->offset = conf.offset;
+
+                        rktpar->offset = conf.offset;
+
+                        rd_kafka_topic_partition_list_add(conf.assignment,
+                                                          rktpar->topic,
+                                                          rktpar->partition);
+                }
+                error = rd_kafka_incremental_assign(rk, partitions);
+                break;
+
+        case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
+                if (conf.verbosity >= 1)
+                        print_partition_list(1, partitions);
+
+                /* Remove partitions from conf.assignment in reverse order
+                 * to minimize array shrink sizes. */
+                for (i = partitions->cnt - 1 ;
+                     conf.assignment && i >= 0 ;
+                     i--) {
+                        rd_kafka_topic_partition_t *rktpar =
+                                &partitions->elems[i];
+
+                        rd_kafka_topic_partition_list_del(conf.assignment,
+                                                          rktpar->topic,
+                                                          rktpar->partition);
+                }
+
+                error = rd_kafka_incremental_unassign(rk, partitions);
+                break;
+
+        default:
+                KC_INFO(0, "failed: %s\n", rd_kafka_err2str(err));
+                break;
+        }
+
+        if (error) {
+                KC_ERROR("Incremental rebalance %s of %d partition(s) "
+                         "failed: %s\n",
+                         err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS ?
+                         "assign" : "unassign",
+                         partitions->cnt, rd_kafka_error_string(error));
+                rd_kafka_error_destroy(error);
+        }
+}
+#endif
+
 static void rebalance_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
                           rd_kafka_topic_partition_list_t *partitions,
                           void *opaque) {
+        rd_kafka_resp_err_t ret_err = RD_KAFKA_RESP_ERR_NO_ERROR;
+
+#if ENABLE_INCREMENTAL_ASSIGN
+        if (!strcmp(rd_kafka_rebalance_protocol(rk), "COOPERATIVE")) {
+                incremental_rebalance_cb(rk, err, partitions, opaque);
+                return;
+        }
+#endif
 
         KC_INFO(1, "Group %s rebalanced (memberid %s): ",
                 conf.group, rd_kafka_memberid(rk));
@@ -589,7 +827,18 @@ static void rebalance_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
                         fprintf(stderr, "assigned: ");
                         print_partition_list(1, partitions);
                 }
-                rd_kafka_assign(rk, partitions);
+                if (conf.offset != RD_KAFKA_OFFSET_INVALID) {
+                        int i;
+                        for (i = 0 ; i < partitions->cnt ; i++)
+                                partitions->elems[i].offset = conf.offset;
+                }
+
+                if (conf.assignment)
+                        rd_kafka_topic_partition_list_destroy(conf.assignment);
+                conf.assignment =
+                        rd_kafka_topic_partition_list_copy(partitions);
+
+                ret_err = rd_kafka_assign(rk, partitions);
                 break;
 
         case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
@@ -597,13 +846,25 @@ static void rebalance_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
                         fprintf(stderr, "revoked: ");
                         print_partition_list(1, partitions);
                 }
-                rd_kafka_assign(rk, NULL);
+
+                if (conf.assignment) {
+                        rd_kafka_topic_partition_list_destroy(conf.assignment);
+                        conf.assignment = NULL;
+                }
+
+                ret_err = rd_kafka_assign(rk, NULL);
                 break;
 
         default:
                 KC_INFO(0, "failed: %s\n", rd_kafka_err2str(err));
                 break;
         }
+
+        if (ret_err)
+                KC_ERROR("Rebalance %s of %d partition(s) failed: %s\n",
+                         err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS ?
+                         "assign" : "unassign",
+                         partitions->cnt, rd_kafka_err2str(ret_err));
 }
 
 /**
@@ -646,6 +907,8 @@ static void kafkaconsumer_run (FILE *fp, char *const *topics, int topic_cnt) {
                 KC_FATAL("Failed to subscribe to %d topics: %s\n",
                          topiclist->cnt, rd_kafka_err2str(err));
 
+        KC_INFO(1, "Waiting for group rebalance\n");
+
         rd_kafka_topic_partition_list_destroy(topiclist);
 
         /* Read messages from Kafka, write to 'fp'. */
@@ -662,12 +925,16 @@ static void kafkaconsumer_run (FILE *fp, char *const *topics, int topic_cnt) {
         }
 
         if ((err = rd_kafka_consumer_close(conf.rk)))
-                KC_FATAL("Failed to close consumer: %s\n", rd_kafka_err2str(err));
+                KC_FATAL("Failed to close consumer: %s\n",
+                         rd_kafka_err2str(err));
 
         /* Wait for outstanding requests to finish. */
         conf.run = 1;
         while (conf.run && rd_kafka_outq_len(conf.rk) > 0)
                 rd_kafka_poll(conf.rk, 50);
+
+        if (conf.assignment)
+                rd_kafka_topic_partition_list_destroy(conf.assignment);
 
         rd_kafka_destroy(conf.rk);
 }
@@ -676,7 +943,7 @@ static void kafkaconsumer_run (FILE *fp, char *const *topics, int topic_cnt) {
 /**
  * Get offsets from conf.startts for consumer_run
  */
-static int64_t *get_offsets(rd_kafka_metadata_topic_t *topic) {
+static int64_t *get_offsets (rd_kafka_metadata_topic_t *topic) {
         int i;
         int64_t *offsets;
         rd_kafka_resp_err_t err;
@@ -691,14 +958,16 @@ static int64_t *get_offsets(rd_kafka_metadata_topic_t *topic) {
                     conf.partition != partition)
                         continue;
 
-                rd_kafka_topic_partition_list_add(rktparlistp,
-                                                  rd_kafka_topic_name(conf.rkt),
-                                                  partition)->offset = conf.startts;
+                rd_kafka_topic_partition_list_add(
+                        rktparlistp,
+                        rd_kafka_topic_name(conf.rkt),
+                        partition)->offset = conf.startts;
 
                 if (conf.partition != RD_KAFKA_PARTITION_UA)
                         break;
         }
-        err = rd_kafka_offsets_for_times(conf.rk, rktparlistp, 10*1000);
+        err = rd_kafka_offsets_for_times(conf.rk, rktparlistp,
+                                         conf.metadata_timeout * 1000);
         if (err)
                 KC_FATAL("offsets_for_times failed: %s", rd_kafka_err2str(err));
 
@@ -752,7 +1021,8 @@ static void consumer_run (FILE *fp) {
 
 
         /* Query broker for topic + partition information. */
-        if ((err = rd_kafka_metadata(conf.rk, 0, conf.rkt, &metadata, 5000)))
+        if ((err = rd_kafka_metadata(conf.rk, 0, conf.rkt, &metadata,
+                                     conf.metadata_timeout * 1000)))
                 KC_FATAL("Failed to query metadata for topic %s: %s",
                          rd_kafka_topic_name(conf.rkt), rd_kafka_err2str(err));
 
@@ -802,7 +1072,11 @@ static void consumer_run (FILE *fp) {
 
                 /* Start consumer for this partition */
                 if (rd_kafka_consume_start_queue(conf.rkt, partition,
-                                                 offsets ? offsets[i] : conf.offset,
+                                                 offsets ? offsets[i] :
+                                                 (conf.offset ==
+                                                  RD_KAFKA_OFFSET_INVALID ?
+                                                  RD_KAFKA_OFFSET_BEGINNING :
+                                                  conf.offset),
                                                  rkqu) == -1)
                         KC_FATAL("Failed to start consuming "
                                  "topic %s [%"PRId32"]: %s",
@@ -856,11 +1130,53 @@ static void consumer_run (FILE *fp) {
         while (conf.run && rd_kafka_outq_len(conf.rk) > 0)
                 rd_kafka_poll(conf.rk, 50);
 
+        if (conf.assignment)
+                rd_kafka_topic_partition_list_destroy(conf.assignment);
+
         rd_kafka_metadata_destroy(metadata);
         rd_kafka_topic_destroy(conf.rkt);
         rd_kafka_destroy(conf.rk);
 }
 
+
+#if ENABLE_MOCK
+/**
+ * @brief Run mock cluster until stdin is closed.
+ */
+static void mock_run (void) {
+        rd_kafka_t *rk;
+        rd_kafka_mock_cluster_t *mcluster;
+        const char *bootstraps;
+        char errstr[512];
+        char buf[64];
+
+        if (!(rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf.rk_conf,
+                                errstr, sizeof(errstr))))
+                KC_FATAL("Failed to create client instance for "
+                         "mock cluster: %s", errstr);
+
+        mcluster = rd_kafka_mock_cluster_new(rk, conf.mock.broker_cnt);
+        if (!mcluster)
+                KC_FATAL("Failed to create mock cluster");
+
+        bootstraps = rd_kafka_mock_cluster_bootstraps(mcluster);
+
+        KC_INFO(1, "Mock cluster started with bootstrap.servers=%s\n",
+                bootstraps);
+        KC_INFO(1, "Press Ctrl-C+Enter or Ctrl-D to terminate.\n");
+
+        printf("BROKERS=%s\n", bootstraps);
+
+        while (conf.run && fgets(buf, sizeof(buf), stdin)) {
+                /* nop */
+        }
+
+        KC_INFO(1, "Terminating mock cluster\n");
+
+        rd_kafka_mock_cluster_destroy(mcluster);
+        rd_kafka_destroy(rk);
+}
+#endif
 
 /**
  * Print metadata information
@@ -956,9 +1272,14 @@ static void metadata_list (void) {
 
         /* Fetch metadata */
         err = rd_kafka_metadata(conf.rk, conf.rkt ? 0 : 1, conf.rkt,
-                                &metadata, 5000);
+                                &metadata, conf.metadata_timeout * 1000);
         if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
-                KC_FATAL("Failed to acquire metadata: %s", rd_kafka_err2str(err));
+                KC_FATAL("Failed to acquire metadata: %s%s",
+                         rd_kafka_err2str(err),
+                         err == RD_KAFKA_RESP_ERR__TRANSPORT ?
+                         " (Are the brokers reachable? "
+                         "Also try increasing the metadata timeout with "
+                         "-m <timeout>?)" : "");
 
 #if HAVE_CONTROLLERID
         controllerid = rd_kafka_controllerid(conf.rk, 0);
@@ -1010,12 +1331,12 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
         rd_kafka_conf_destroy(tmpconf);
 
         fprintf(out,
-                "kafkacat - Apache Kafka producer and consumer tool\n"
-                "https://github.com/edenhill/kafkacat\n"
-                "Copyright (c) 2014-2019, Magnus Edenhill\n"
-                "Version %s (%slibrdkafka %s builtin.features=%s)\n"
+                "kcat - Apache Kafka producer and consumer tool\n"
+                "https://github.com/edenhill/kcat\n"
+                "Copyright (c) 2014-2021, Magnus Edenhill\n"
+                "Version %s (%s%slibrdkafka %s builtin.features=%s)\n"
                 "\n",
-                KAFKACAT_VERSION,
+                KCAT_VERSION,
                 ""
 #if ENABLE_JSON
                 "JSON, "
@@ -1023,7 +1344,21 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
 #if ENABLE_AVRO
                 "Avro, "
 #endif
+#if ENABLE_TXNS
+                "Transactions, "
+#endif
+#if ENABLE_INCREMENTAL_ASSIGN
+                "IncrementalAssign, "
+#endif
+#if ENABLE_MOCK
+                "MockCluster, "
+#endif
                 ,
+#if ENABLE_JSON
+                json_can_emit_verbatim() ? "JSONVerbatim, " : "",
+#else
+                "",
+#endif
                 rd_kafka_version_str(), features
                 );
 
@@ -1031,28 +1366,41 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 exit(exitcode);
 
         fprintf(out, "\n"
-                "General options:\n"
-                "  -C | -P | -L | -Q  Mode: Consume, Produce, Metadata List, Query mode\n"
+                "Mode:\n"
+                "  -P                 Producer\n"
+                "  -C                 Consumer\n"
 #if ENABLE_KAFKACONSUMER
-                "  -G <group-id>      Mode: High-level KafkaConsumer (Kafka >=0.9 balanced consumer groups)\n"
-                "                     Expects a list of topics to subscribe to\n"
+                "  -G <group-id>      High-level KafkaConsumer (Kafka >=0.9 balanced consumer groups)\n"
 #endif
+                "  -L                 Metadata List\n"
+                "  -Q                 Query mode\n"
+#if ENABLE_MOCK
+                "  -M <broker-cnt>    Start Mock cluster\n"
+#endif
+                "\n"
+                "General options for most modes:\n"
                 "  -t <topic>         Topic to consume from, produce to, "
                 "or list\n"
                 "  -p <partition>     Partition\n"
                 "  -b <brokers,..>    Bootstrap broker(s) (host[:port])\n"
-                "  -D <delim>         Message delimiter character:\n"
-                "                     a-z.. | \\r | \\n | \\t | \\xNN\n"
+                "  -D <delim>         Message delimiter string:\n"
+                "                     a-z | \\r | \\n | \\t | \\xNN ..\n"
                 "                     Default: \\n\n"
-                "  -E                 Do not exit on non fatal error\n"
                 "  -K <delim>         Key delimiter (same format as -D)\n"
                 "  -c <cnt>           Limit message count\n"
+                "  -m <seconds>       Metadata (et.al.) request timeout.\n"
+                "                     This limits how long kcat will block\n"
+                "                     while waiting for initial metadata to be\n"
+                "                     retrieved from the Kafka cluster.\n"
+                "                     It also sets the timeout for the producer's\n"
+                "                     transaction commits, init, aborts, etc.\n"
+                "                     Default: 5 seconds.\n"
                 "  -F <config-file>   Read configuration properties from file,\n"
                 "                     file format is \"property=value\".\n"
-                "                     The KAFKACAT_CONFIG=path environment can "
-                "also be used, but -F takes preceedence.\n"
+                "                     The KCAT_CONFIG=path environment can "
+                "also be used, but -F takes precedence.\n"
                 "                     The default configuration file is "
-                "$HOME/.config/kafkacat.conf\n"
+                "$HOME/.config/kcat.conf\n"
                 "  -X list            List available librdkafka configuration "
                 "properties\n"
                 "  -X prop=val        Set librdkafka configuration property.\n"
@@ -1073,6 +1421,7 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 "                     " RD_KAFKA_DEBUG_CONTEXTS "\n"
                 "  -q                 Be quiet (verbosity set to 0)\n"
                 "  -v                 Increase verbosity\n"
+                "  -E                 Do not exit on non-fatal error\n"
                 "  -V                 Print version\n"
                 "  -h                 Print usage help\n"
                 "\n"
@@ -1097,6 +1446,12 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 "                     With -l, only one file permitted.\n"
                 "                     Otherwise, the entire file contents will\n"
                 "                     be sent as one single message.\n"
+                "  -X transactional.id=.. Enable transactions and send all\n"
+                "                     messages in a single transaction which\n"
+                "                     is committed when stdin is closed or the\n"
+                "                     input file(s) are fully read.\n"
+                "                     If kcat is terminated through Ctrl-C\n"
+                "                     (et.al) the transaction will be aborted.\n"
                 "\n"
                 "Consumer options:\n"
                 "  -o <offset>        Offset to start consuming from:\n"
@@ -1142,7 +1497,7 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 "                       or: -s avro - both key and value are Avro-serialized\n"
 #endif
 #if ENABLE_AVRO
-                "  -r <url>           Schema registry URL (requires avro deserializer to be used with -s)\n"
+                "  -r <url>           Schema registry URL (when avro deserializer is used with -s)\n"
 #endif
                 "  -D <delim>         Delimiter to separate messages on output\n"
                 "  -K <delim>         Print message keys prefixing the message\n"
@@ -1150,7 +1505,7 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 "  -O                 Print message offset using -K delimiter\n"
                 "  -c <cnt>           Exit after consuming this number "
                 "of messages\n"
-                "  -Z                 Print NULL values and keys as \"%s\""
+                "  -Z                 Print NULL values and keys as \"%s\" "
                 "instead of empty.\n"
                 "                     For JSON (-J) the nullstr is always null.\n"
                 "  -u                 Unbuffered output\n"
@@ -1166,6 +1521,20 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 "                     Requires broker >= 0.10.0.0 and librdkafka >= 0.9.3.\n"
                 "                     Multiple -t .. are allowed but a partition\n"
                 "                     must only occur once.\n"
+                "\n"
+#if ENABLE_MOCK
+                "Mock cluster options (-M):\n"
+                "  The mock cluster is provided by librdkafka and supports a\n"
+                "  reasonable set of Kafka protocol functionality:\n"
+                "  producing, consuming, consumer groups, transactions, etc.\n"
+                "  When kcat is started with -M .. it will print the mock cluster\n"
+                "  bootstrap.servers to stdout, like so:\n"
+                "    BROKERS=broker1:port,broker2:port,..\n"
+                "  Use this list of brokers as bootstrap.servers in your Kafka application.\n"
+                "  When kcat exits (Ctrl-C, Ctrl-D or when stdin is closed) the\n"
+                "  cluster will be terminated.\n"
+                "\n"
+#endif
                 "\n"
                 "Format string tokens:\n"
                 "  %%s                 Message payload\n"
@@ -1193,33 +1562,40 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
                 " { \"topic\": str, \"partition\": int, \"offset\": int,\n"
                 "   \"tstype\": \"create|logappend|unknown\", \"ts\": int, "
                 "// timestamp in milliseconds since epoch\n"
+                "   \"broker\": int,\n"
                 "   \"headers\": { \"<name>\": str, .. }, // optional\n"
                 "   \"key\": str|json, \"payload\": str|json,\n"
-                "   \"key_error\": str, \"payload_error\": str } //optional\n"
-                " (note: key_error and payload_error are only included if "
-                "deserialization failed)\n"
+                "   \"key_error\": str, \"payload_error\": str, //optional\n"
+                "   \"key_schema_id\": int, "
+                "\"value_schema_id\": int //optional\n"
+                " }\n"
+                " notes:\n"
+                "   - key_error and payload_error are only included if "
+                "deserialization fails.\n"
+                "   - key_schema_id and value_schema_id are included for "
+                "successfully deserialized Avro messages.\n"
                 "\n"
 #endif
                 "Consumer mode (writes messages to stdout):\n"
-                "  kafkacat -b <broker> -t <topic> -p <partition>\n"
+                "  kcat -b <broker> -t <topic> -p <partition>\n"
                 " or:\n"
-                "  kafkacat -C -b ...\n"
+                "  kcat -C -b ...\n"
                 "\n"
 #if ENABLE_KAFKACONSUMER
                 "High-level KafkaConsumer mode:\n"
-                "  kafkacat -b <broker> -G <group-id> topic1 top2 ^aregex\\d+\n"
+                "  kcat -b <broker> -G <group-id> topic1 top2 ^aregex\\d+\n"
                 "\n"
 #endif
                 "Producer mode (reads messages from stdin):\n"
-                "  ... | kafkacat -b <broker> -t <topic> -p <partition>\n"
+                "  ... | kcat -b <broker> -t <topic> -p <partition>\n"
                 " or:\n"
-                "  kafkacat -P -b ...\n"
+                "  kcat -P -b ...\n"
                 "\n"
                 "Metadata listing:\n"
-                "  kafkacat -L -b <broker> [-t <topic>]\n"
+                "  kcat -L -b <broker> [-t <topic>]\n"
                 "\n"
                 "Query offset by timestamp:\n"
-                "  kafkacat -Q -b broker -t <topic>:<partition>:<timestamp>\n"
+                "  kcat -Q -b broker -t <topic>:<partition>:<timestamp>\n"
                 "\n",
                 conf.null_str
                 );
@@ -1232,6 +1608,7 @@ static void RD_NORETURN usage (const char *argv0, int exitcode,
  */
 static void term (int sig) {
         conf.run = 0;
+        conf.term_sig = sig;
 }
 
 
@@ -1268,19 +1645,41 @@ static void error_cb (rd_kafka_t *rk, int err,
 
 
 /**
- * Parse delimiter string from command line arguments.
+ * @brief Parse delimiter string from command line arguments and return
+ *        an allocated copy.
  */
-static int parse_delim (const char *str) {
-        int delim;
-        if (!strncmp(str, "\\x", strlen("\\x")))
-                delim = strtoul(str+strlen("\\x"), NULL, 16) & 0xff;
-        else if (!strcmp(str, "\\n"))
-                delim = (int)'\n';
-        else if (!strcmp(str, "\\t"))
-                delim = (int)'\t';
-        else
-                delim = (int)*str & 0xff;
-        return delim;
+static char *parse_delim (const char *instr) {
+        char *str;
+
+        /* Make a copy so we can modify the string. */
+        str = strdup(instr);
+
+        while (1) {
+                size_t skip = 0;
+                char *t;
+
+                if ((t = strstr(str, "\\n"))) {
+                        *t = '\n';
+                        skip = 1;
+                } else if ((t = strstr(str, "\\t"))) {
+                        *t = '\t';
+                        skip = 1;
+                } else if ((t = strstr(str, "\\x"))) {
+                        char *end;
+                        int x;
+                        x = strtoul(t+strlen("\\x"), &end, 16) & 0xff;
+                        if (end == t+strlen("\\x"))
+                                KC_FATAL("Delimiter %s expects hex number", t);
+                        *t = (char)x;
+                        skip = (int)(end - t) - 1;
+                } else
+                        break;
+
+                if (t && skip)
+                        memmove(t+1, t+1+skip, strlen(t+1+skip)+1);
+        }
+
+        return str;
 }
 
 /**
@@ -1349,9 +1748,11 @@ static void conf_dump (void) {
 /**
  * @brief Try setting a config property. Provides "topic." fallthru.
  *
+ * @remark \p val may be truncated by this function.
+ *
  * @returns -1 on failure or 0 on success.
  */
-static int try_conf_set (const char *name, const char *val,
+static int try_conf_set (const char *name, char *val,
                          char *errstr, size_t errstr_size) {
         rd_kafka_conf_res_t res = RD_KAFKA_CONF_UNKNOWN;
         size_t srlen = strlen("schema.registry.");
@@ -1364,15 +1765,30 @@ static int try_conf_set (const char *name, const char *val,
                 if (!conf.srconf)
                         conf.srconf = serdes_conf_new(NULL, 0, NULL);
 
-                if (!strcmp(name, "schema.registry.url"))
+                if (!strcmp(name, "schema.registry.url")) {
+                        char *t;
+
+                        /* Trim trailing slashes from URL to avoid 404 */
+                        for (t = val + strlen(val) - 1;
+                             t >= val && *t == '/'; t--)
+                                *t = '\0';
+
+                        if (!*t) {
+                                snprintf(errstr, errstr_size,
+                                         "schema.registry.url is empty");
+                                return -1;
+                        }
+
+                        conf.flags |= CONF_F_SR_URL_SEEN;
                         srlen = 0;
+                }
 
                 serr = serdes_conf_set(conf.srconf, name+srlen, val,
                                        errstr, errstr_size);
                 return serr == SERDES_ERR_OK ? 0 : -1;
 #else
                 snprintf(errstr, errstr_size,
-                         "This build of kafkacat lacks "
+                         "This build of kcat lacks "
                          "Avro/Schema-Registry support");
                 return -1;
 #endif
@@ -1438,11 +1854,8 @@ static int try_conf_set (const char *name, const char *val,
         if (!strcmp(name, "api.version.request"))
                 conf.flags |= CONF_F_APIVERREQ_USER;
 
-        /* Interception */
 #if RD_KAFKA_VERSION >= 0x00090000
-        if (!strcmp(name, "quota.support.enable"))
-                rd_kafka_conf_set_throttle_cb(conf.rk_conf,
-                                              throttle_cb);
+        rd_kafka_conf_set_throttle_cb(conf.rk_conf, throttle_cb);
 #endif
 
 
@@ -1632,29 +2045,132 @@ static int read_conf_file (const char *path, int fatal) {
 
 /**
  * @returns the value for environment variable \p env, or NULL
- *          if it is not set, is empty, or not supported on platform.
+ *          if it is not set or it is empty.
  */
 static const char *kc_getenv (const char *env) {
-#ifdef _MSC_VER
-        return NULL;
-#else
         const char *val;
         if (!(val = getenv(env)) || !*val)
                 return NULL;
         return val;
-#endif
 }
 
 static void read_default_conf_files (void) {
-        char path[512];
+        char kpath[512], kpath2[512];
         const char *home;
 
         if (!(home = kc_getenv("HOME")))
                 return;
 
-        snprintf(path, sizeof(path), "%s/.config/kafkacat.conf", home);
+        snprintf(kpath, sizeof(kpath), "%s/.config/kcat.conf", home);
 
-        read_conf_file(path, 0/*not fatal*/);
+        if (read_conf_file(kpath, 0/*not fatal*/) == 0)
+                return;
+
+        snprintf(kpath2, sizeof(kpath2), "%s/.config/kafkacat.conf", home);
+
+        if (read_conf_file(kpath2, 0/*not fatal*/) == 0) {
+                KC_INFO(1,
+                        "Configuration filename kafkacat.conf is "
+                        "deprecated!\n");
+                KC_INFO(1, "Rename %s to %s\n", kpath2, kpath);
+        }
+}
+
+
+
+static int unittest_strnstr (void) {
+        struct {
+                const char *sep;
+                const char *hay;
+                int offset;
+        } exp[] = {
+                { ";Sep;", ";Sep;Post", 0 },
+                { ";Sep;", ";Sep;", 0 },
+                { ";Sep;", "Pre;Sep;Post", 3 },
+                { ";Sep;", "Pre;Sep;", 3 },
+                { ";Sep;", "Pre;SepPost", -1 },
+                { ";KeyDel;", "Key1;KeyDel;Value1", 4 },
+                { ";", "Is The;", 6 },
+                { NULL },
+        };
+        int i;
+        int fails = 0;
+
+        for (i = 0 ; exp[i].sep ; i++) {
+                const char *t = rd_strnstr(exp[i].hay, strlen(exp[i].hay),
+                                           exp[i].sep, strlen(exp[i].sep));
+                const char *e = exp[i].hay + exp[i].offset;
+                const char *fail = NULL;
+
+                if (exp[i].offset == -1) {
+                        if (t)
+                                fail = "expected no match";
+                } else if (!t) {
+                        fail = "expected match";
+                } else if (t != e)
+                        fail = "invalid match";
+
+                if (!fail)
+                        continue;
+
+                fprintf(stderr,
+                        "%s: FAILED: for hay %d: "
+                        "match is %p '%s' for %p '%s' in %p '%s' "
+                        "(want offset %d, not %d): %s\n",
+                        __FUNCTION__,
+                        i,
+                        t, t,
+                        exp[i].sep, exp[i].sep,
+                        exp[i].hay, exp[i].hay,
+                        exp[i].offset,
+                        t ? (int)(t - exp[i].hay) : -1,
+                        fail);
+                fails++;
+        }
+
+        return fails;
+}
+
+static int unittest_parse_delim (void) {
+        struct {
+                const char *in;
+                const char *exp;
+        } delims[] = {
+                { "", "" },
+                { "\\n", "\n" },
+                { "\\t\\n\\n", "\t\n\n" },
+                { "\\x54!\\x45\\x53T", "T!EST" },
+                { "\\x30", "0" },
+                { NULL }
+        };
+        int i;
+        int fails = 0;
+
+        for (i = 0 ; delims[i].in ; i++) {
+                char *out = parse_delim(delims[i].in);
+                if (strcmp(out, delims[i].exp))
+                        fprintf(stderr, "%s: FAILED: "
+                                "expected '%s' to return '%s', not '%s'\n",
+                                __FUNCTION__, delims[i].in, delims[i].exp, out);
+                free(out);
+        }
+
+        return fails;
+}
+
+
+/**
+ * @brief Run unittests
+ *
+ * @returns the number of failed tests.
+ */
+static int unittest (void) {
+        int r = 0;
+
+        r += unittest_strnstr();
+        r += unittest_parse_delim();
+
+        return r;
 }
 
 /**
@@ -1700,23 +2216,43 @@ static void argparse (int argc, char **argv,
         int i;
 
         while ((opt = getopt(argc, argv,
-                             ":PCG:LQt:p:b:z:o:eED:K:k:H:Od:qvF:X:c:Tuf:ZlVh"
-                             "s:r:J")) != -1) {
+                             ":PCG:LQM:t:p:b:z:o:eED:K:k:H:Od:qvF:X:c:Tuf:ZlVh"
+                             "s:r:Jm:U")) != -1) {
                 switch (opt) {
                 case 'P':
                 case 'C':
                 case 'L':
                 case 'Q':
+                        if (conf.mode && conf.mode != opt)
+                                KC_FATAL("Do not mix modes: -%c seen when "
+                                         "-%c already set",
+                                         (char)opt, conf.mode);
                         conf.mode = opt;
                         break;
 #if ENABLE_KAFKACONSUMER
                 case 'G':
+                        if (conf.mode && conf.mode != opt)
+                                KC_FATAL("Do not mix modes: -%c seen when "
+                                         "-%c already set",
+                                         (char)opt, conf.mode);
                         conf.mode = opt;
                         conf.group = optarg;
                         if (rd_kafka_conf_set(conf.rk_conf, "group.id", optarg,
                                               errstr, sizeof(errstr)) !=
                             RD_KAFKA_CONF_OK)
                                 KC_FATAL("%s", errstr);
+                        break;
+#endif
+#if ENABLE_MOCK
+                case 'M':
+                        if (conf.mode && conf.mode != opt)
+                                KC_FATAL("Do not mix modes: -%c seen when "
+                                         "-%c already set",
+                                         (char)opt, conf.mode);
+                        conf.mode = opt;
+                        conf.mock.broker_cnt = atoi(optarg);
+                        if (conf.mock.broker_cnt <= 0)
+                                KC_FATAL("-M <broker_cnt> expected");
                         break;
 #endif
                 case 't':
@@ -1778,7 +2314,7 @@ static void argparse (int argc, char **argv,
 #if ENABLE_JSON
                         conf.flags |= CONF_F_FMT_JSON;
 #else
-                        KC_FATAL("This build of kafkacat lacks JSON support");
+                        KC_FATAL("This build of kcat lacks JSON support");
 #endif
                         break;
 
@@ -1811,10 +2347,13 @@ static void argparse (int argc, char **argv,
                 case 'r':
 #if ENABLE_AVRO
                         if (!*optarg)
-                                KC_FATAL("-s url must not be empty");
-                        conf.schema_registry_url = optarg;
+                                KC_FATAL("-r url must not be empty");
+
+                        if (try_conf_set("schema.registry.url", optarg,
+                                         errstr, sizeof(errstr)) == -1)
+                                KC_FATAL("%s", errstr);
 #else
-                        KC_FATAL("This build of kafkacat lacks "
+                        KC_FATAL("This build of kcat lacks "
                                  "Avro/Schema-Registry support");
 #endif
                         break;
@@ -1840,6 +2379,9 @@ static void argparse (int argc, char **argv,
                         break;
                 case 'c':
                         conf.msg_cnt = strtoll(optarg, NULL, 10);
+                        break;
+                case 'm':
+                        conf.metadata_timeout = strtoll(optarg, NULL, 10);
                         break;
                 case 'Z':
                         conf.flags |= CONF_F_NULL;
@@ -1905,6 +2447,13 @@ static void argparse (int argc, char **argv,
                 }
                 break;
 
+                case 'U':
+                        if (unittest())
+                                exit(1);
+                        else
+                                exit(0);
+                        break;
+
                 case 'V':
                         usage(argv[0], 0, NULL, 1);
                         break;
@@ -1921,8 +2470,14 @@ static void argparse (int argc, char **argv,
 
 
         if (conf_files_read == 0) {
-                const char *cpath = kc_getenv("KAFKACAT_CONFIG");
+                const char *cpath = kc_getenv("KCAT_CONFIG");
                 if (cpath) {
+                        conf.flags |= CONF_F_NO_CONF_SEARCH;
+                        read_conf_file(cpath, 1/*fatal errors*/);
+
+                } else if ((cpath = kc_getenv("KAFKACAT_CONFIG"))) {
+                        KC_INFO(1, "KAFKA_CONFIG is deprecated!\n");
+                        KC_INFO(1, "Rename KAFKA_CONFIG to KCAT_CONFIG\n");
                         conf.flags |= CONF_F_NO_CONF_SEARCH;
                         read_conf_file(cpath, 1/*fatal errors*/);
                 }
@@ -1937,7 +2492,7 @@ static void argparse (int argc, char **argv,
                 exit(0);
         }
 
-        if (!(conf.flags & CONF_F_BROKERS_SEEN))
+        if (!(conf.flags & CONF_F_BROKERS_SEEN) && conf.mode != 'M')
                 usage(argv[0], 1, "-b <broker,..> missing", 0);
 
         /* Decide mode if not specified */
@@ -1951,7 +2506,7 @@ static void argparse (int argc, char **argv,
         }
 
 
-        if (!strchr("GLQ", conf.mode) && !conf.topic)
+        if (!strchr("GLQM", conf.mode) && !conf.topic)
                 usage(argv[0], 1, "-t <topic> missing", 0);
         else if (conf.mode == 'Q' && !*rktparlistp)
                 usage(argv[0], 1,
@@ -1997,7 +2552,7 @@ static void argparse (int argc, char **argv,
 
                 if (conf.pack[i] && !strcmp(conf.pack[i], "avro")) {
 #if !ENABLE_AVRO
-                        KC_FATAL("This build of kafkacat lacks "
+                        KC_FATAL("This build of kcat lacks "
                                  "Avro/Schema-Registry support");
 #endif
 #if ENABLE_JSON
@@ -2007,12 +2562,12 @@ static void argparse (int argc, char **argv,
                          * but my own fork of yajl does. */
                         if (conf.flags & CONF_F_FMT_JSON &&
                             !json_can_emit_verbatim())
-                                KC_FATAL("This build of kafkacat lacks "
+                                KC_FATAL("This build of kcat lacks "
                                          "support for emitting "
                                          "JSON-formatted "
                                          "message keys and values: "
                                          "try without -J or build "
-                                         "kafkacat with yajl from "
+                                         "kcat with yajl from "
                                          "https://github.com/edenhill/yajl");
 #endif
 
@@ -2029,36 +2584,33 @@ static void argparse (int argc, char **argv,
          * Verify and initialize Avro/SR
          */
 #if ENABLE_AVRO
-        if (!!conf.schema_registry_url !=
-            !!(conf.flags & (CONF_F_FMT_AVRO_VALUE|CONF_F_FMT_AVRO_KEY)))
-                KC_FATAL("-r requires -s avro and vice-versa");
+        if (conf.flags & (CONF_F_FMT_AVRO_VALUE|CONF_F_FMT_AVRO_KEY)) {
 
-        if (conf.schema_registry_url) {
-                char *t;
+                if (!(conf.flags & CONF_F_SR_URL_SEEN))
+                        KC_FATAL("-s avro requires -r <sr_url>");
 
                 if (!strchr("GC", conf.mode))
-                        KC_FATAL("Schema-registry support is only available "
-                                 "in the consumer");
-
-                /* Trim trailing slashes from URL to avoid 404 */
-                t = &conf.schema_registry_url[strlen(conf.
-                                                     schema_registry_url)-1];
-                while (t >= conf.schema_registry_url && *t == '/') {
-                        *t = '\0';
-                        t--;
-                }
-
-                if (try_conf_set("schema.registry.url",
-                                 conf.schema_registry_url,
-                                 errstr, sizeof(errstr)) == -1)
-                        KC_FATAL("%s", errstr);
-
+                        KC_FATAL("Avro and Schema-registry support is "
+                                 "currently only available in the consumer");
 
                 /* Initialize Avro/Schema-Registry client */
                 kc_avro_init(NULL, NULL, NULL, NULL);
         }
 #endif
 
+
+        /* If avro key is to be deserialized, set up an delimiter so that
+         * the key is actually emitted. */
+        if ((conf.flags & CONF_F_FMT_AVRO_KEY) && !key_delim)
+                key_delim = "";
+
+        if (key_delim) {
+                conf.key_delim = parse_delim(key_delim);
+                conf.key_delim_size = strlen(conf.key_delim);
+        }
+
+        conf.delim = parse_delim(delim);
+        conf.delim_size = strlen(conf.delim);
 
         if (strchr("GC", conf.mode)) {
                 /* Must be explicitly enabled for librdkafka >= v1.0.0 */
@@ -2069,15 +2621,15 @@ static void argparse (int argc, char **argv,
                         if ((conf.flags & CONF_F_FMT_JSON)) {
                                 /* For JSON the format string is simply the
                                  * output object delimiter (e.g., newline). */
-                                fmt = delim;
+                                fmt = conf.delim;
                         } else {
-                                if (key_delim)
+                                if (conf.key_delim)
                                         snprintf(tmp_fmt, sizeof(tmp_fmt),
                                                  "%%k%s%%s%s",
-                                                 key_delim, delim);
+                                                 conf.key_delim, conf.delim);
                                 else
                                         snprintf(tmp_fmt, sizeof(tmp_fmt),
-                                                 "%%s%s", delim);
+                                                 "%%s%s", conf.delim);
                                 fmt = tmp_fmt;
                         }
                 }
@@ -2085,9 +2637,9 @@ static void argparse (int argc, char **argv,
                 fmt_parse(fmt);
 
         } else if (conf.mode == 'P') {
-                conf.delim = parse_delim(delim);
-                if (conf.flags & CONF_F_KEY_DELIM)
-                        conf.key_delim = parse_delim(key_delim);
+                if (conf.delim_size == 0)
+                        KC_FATAL("Message delimiter -D must not be empty "
+                                 "when producing");
         }
 
         /* Automatically enable API version requests if needed and
@@ -2111,22 +2663,17 @@ int main (int argc, char **argv) {
         struct timeval tv;
         rd_kafka_topic_partition_list_t *rktparlist = NULL;
 
-        /* Certain Docker images don't have kafkacat as the entry point,
-         * requiring `kafkacat` to be the first argument. As these images
+        /* Certain Docker images don't have kcat as the entry point,
+         * requiring `kcat` to be the first argument. As these images
          * are fixed the examples get outdated and that first argument
-         * will still be passed to the container and thus kafkacat,
+         * will still be passed to the container and thus kcat,
          * so remove it here. */
-        if (argc > 1 && !strcmp(argv[1], "kafkacat")) {
+        if (argc > 1 && (!strcmp(argv[1], "kcat") ||
+                         !strcmp(argv[1], "kafkacat"))) {
                 if (argc > 2)
                         memmove(&argv[1], &argv[2], sizeof(*argv) * (argc - 2));
                 argc--;
         }
-
-        signal(SIGINT, term);
-        signal(SIGTERM, term);
-#ifdef SIGPIPE
-        signal(SIGPIPE, term);
-#endif
 
         /* Seed rng for random partitioner, jitter, etc. */
         rd_gettimeofday(&tv, NULL);
@@ -2167,6 +2714,12 @@ int main (int argc, char **argv) {
                 }
         }
 
+        signal(SIGINT, term);
+        signal(SIGTERM, term);
+#ifdef SIGPIPE
+        signal(SIGPIPE, term);
+#endif
+
         /* Run according to mode */
         switch (conf.mode)
         {
@@ -2176,6 +2729,9 @@ int main (int argc, char **argv) {
 
 #if ENABLE_KAFKACONSUMER
         case 'G':
+                if (conf.stopts || conf.startts)
+                        KC_FATAL("-o ..@ timestamps can't be used "
+                                 "with -G mode\n");
                 kafkaconsumer_run(stdout, &argv[optind], argc-optind);
                 break;
 #endif
@@ -2199,6 +2755,12 @@ int main (int argc, char **argv) {
                 rd_kafka_topic_partition_list_destroy(rktparlist);
                 break;
 
+#if ENABLE_MOCK
+        case 'M':
+                mock_run();
+                break;
+#endif
+
         default:
                 usage(argv[0], 0, NULL, 0);
                 break;
@@ -2206,6 +2768,11 @@ int main (int argc, char **argv) {
 
         if (conf.headers)
                 rd_kafka_headers_destroy(conf.headers);
+
+        if (conf.key_delim)
+                free(conf.key_delim);
+        if (conf.delim)
+                free(conf.delim);
 
         if (in != stdin)
                 fclose(in);
