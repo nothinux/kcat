@@ -193,7 +193,6 @@ void error0 (int erroronexit, const char *func, int line,
 
 void set_oauthbearer_token (rd_kafka_t *rk);
 
-
 /*
  * format.c
  */

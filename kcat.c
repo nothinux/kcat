@@ -161,7 +161,6 @@ void set_oauthbearer_token (rd_kafka_t *rk) {
 #endif
 }
 
-
 /**
  * The delivery report callback is called once per message to
  * report delivery success or failure.
@@ -394,7 +393,9 @@ static void producer_run (FILE *fp, char **paths, int pathcnt) {
                                      errstr, sizeof(errstr))))
                 KC_FATAL("Failed to create producer: %s", errstr);
 
+
         set_oauthbearer_token(conf.rk);
+
 
         if (!conf.debug && conf.verbosity == 0)
                 rd_kafka_set_log_level(conf.rk, 0);
@@ -886,6 +887,7 @@ static void kafkaconsumer_run (FILE *fp, char *const *topics, int topic_cnt) {
                 KC_FATAL("Failed to create consumer: %s", errstr);
         conf.rk_conf  = NULL;
 
+
         set_oauthbearer_token(conf.rk);
 
         /* Forward main event queue to consumer queue so we can
@@ -1253,6 +1255,7 @@ static void metadata_list (void) {
         if (!(conf.rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf.rk_conf,
                                      errstr, sizeof(errstr))))
                 KC_FATAL("Failed to create producer: %s", errstr);
+
 
         set_oauthbearer_token(conf.rk);
 
@@ -1823,7 +1826,6 @@ static int try_conf_set (const char *name, char *val,
                 return 0;
 #endif
         }
-
 
         /* Try "topic." prefixed properties on topic
          * conf first, and then fall through to global if
@@ -2779,6 +2781,7 @@ int main (int argc, char **argv) {
 
         if (conf.oauthbearer_token)
                 free(conf.oauthbearer_token);
+
 
         rd_kafka_wait_destroyed(5000);
 
