@@ -153,6 +153,10 @@ struct conf {
 
         char   *debug;
 
+        char   *oauthbearer_token;
+        int64_t oauthbearer_token_lifetime;
+        const char *oauthbearer_token_principal;
+        
         int term_sig;  /**< Termination signal */
 
 #if ENABLE_AVRO
@@ -187,6 +191,7 @@ void error0 (int erroronexit, const char *func, int line,
         } while (0)
 
 
+void set_oauthbearer_token (rd_kafka_t *rk);
 
 /*
  * format.c
